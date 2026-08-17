@@ -85,6 +85,29 @@ export async function getOwnedSession(sessionId: string, userId: string) {
   return session;
 }
 
+/**
+ * Loads a session-question row together with its question's text/explanation
+ * and the parent session's questionCount in a single joined round trip.
+ * Used by answerQuestion/nextQuestion/getQuestionPayload, which each need
+ * some subset of this same data — previously fetched via 2-3 separate
+ * sequential queries per call, which is the main source of per-click latency
+ * in the quiz flow.
+ */
+async function loadSessionQuestionDetail(sessionId: string, orderIndex: number) {
+  const [row] = await db
+    .select({
+      sessionQuestion: sessionQuestions,
+      questionText: questions.questionText,
+      explanation: questions.explanation,
+      questionCount: quizSessions.questionCount,
+    })
+    .from(sessionQuestions)
+    .innerJoin(questions, eq(sessionQuestions.questionId, questions.id))
+    .innerJoin(quizSessions, eq(sessionQuestions.sessionId, quizSessions.id))
+    .where(and(eq(sessionQuestions.sessionId, sessionId), eq(sessionQuestions.orderIndex, orderIndex)));
+  return row ?? null;
+}
+
 export type StartSessionInput =
   | {
       userId: string;
@@ -214,24 +237,17 @@ export type AnswerInput = {
 };
 
 export async function answerQuestion(input: AnswerInput) {
-  const [sq] = await db
-    .select()
-    .from(sessionQuestions)
-    .where(
-      and(
-        eq(sessionQuestions.sessionId, input.sessionId),
-        eq(sessionQuestions.orderIndex, input.orderIndex)
-      )
-    );
+  const detail = await loadSessionQuestionDetail(input.sessionId, input.orderIndex);
+  if (!detail) throw new QuizSessionError("Question not found for this session.", "not_found");
+  const { sessionQuestion: sq, explanation } = detail;
 
-  if (!sq) throw new QuizSessionError("Question not found for this session.", "not_found");
   if (!sq.servedAt || !sq.deadlineAt) {
     throw new QuizSessionError("This question has not been served yet.", "not_served");
   }
   if (sq.answeredAt) {
     // idempotent: return the already-recorded result rather than erroring,
     // in case of a client retry/double-submit
-    return questionResultFrom(sq);
+    return questionResultFrom(sq, explanation);
   }
 
   const now = new Date();
@@ -266,21 +282,16 @@ export async function answerQuestion(input: AnswerInput) {
     .where(eq(sessionQuestions.id, sq.id))
     .returning();
 
-  return questionResultFrom(updated);
+  return questionResultFrom(updated, explanation);
 }
 
-async function questionResultFrom(sq: typeof sessionQuestions.$inferSelect) {
-  const [question] = await db
-    .select({ explanation: questions.explanation })
-    .from(questions)
-    .where(eq(questions.id, sq.questionId));
-
+function questionResultFrom(sq: typeof sessionQuestions.$inferSelect, explanation: string) {
   return {
     isCorrect: sq.isCorrect,
     timedOut: sq.timedOut,
     pointsAwarded: sq.pointsAwarded,
     correctOptionIndex: sq.correctOptionIndexShuffled,
-    explanation: question?.explanation ?? "",
+    explanation,
   };
 }
 
@@ -290,13 +301,9 @@ export async function nextQuestion(sessionId: string, currentOrderIndex: number)
   // No hardcoded quiz-length check: a session's sessionQuestions row count
   // already equals its real question count (set at startSession time), so
   // "no row at nextOrderIndex" IS the done signal, for any session length.
-  const [sq] = await db
-    .select()
-    .from(sessionQuestions)
-    .where(
-      and(eq(sessionQuestions.sessionId, sessionId), eq(sessionQuestions.orderIndex, nextOrderIndex))
-    );
-  if (!sq) return { done: true as const };
+  const detail = await loadSessionQuestionDetail(sessionId, nextOrderIndex);
+  if (!detail) return { done: true as const };
+  const { sessionQuestion: sq, questionText, questionCount } = detail;
 
   const now = new Date();
   const deadline = computeDeadline(now);
@@ -306,24 +313,14 @@ export async function nextQuestion(sessionId: string, currentOrderIndex: number)
     .where(eq(sessionQuestions.id, sq.id))
     .returning();
 
-  const [question] = await db
-    .select({ questionText: questions.questionText })
-    .from(questions)
-    .where(eq(questions.id, updated.questionId));
-
-  const [session] = await db
-    .select({ questionCount: quizSessions.questionCount })
-    .from(quizSessions)
-    .where(eq(quizSessions.id, sessionId));
-
   return {
     done: false as const,
     question: {
       orderIndex: updated.orderIndex,
-      questionText: question?.questionText ?? "",
+      questionText,
       shuffledOptions: updated.shuffledOptions,
       deadlineAt: deadline.toISOString(),
-      totalQuestions: session?.questionCount ?? QUESTIONS_PER_QUIZ,
+      totalQuestions: questionCount,
     },
   };
 }
@@ -414,23 +411,27 @@ export async function finishSession(sessionId: string) {
 
   const now = new Date();
   const totalTimeMs = now.getTime() - session.startedAt.getTime();
-  await db
-    .update(quizSessions)
-    .set({ status: "completed", score, completedAt: now })
-    .where(eq(quizSessions.id, sessionId));
 
-  const [{ value: priorCount }] = await db
-    .select({ value: countFn() })
-    .from(attempts)
-    .where(
-      session.mode === "contest"
-        ? and(
-            eq(attempts.userId, session.userId),
-            eq(attempts.mode, session.mode),
-            eq(attempts.roundId, session.roundId!)
-          )
-        : and(eq(attempts.userId, session.userId), eq(attempts.mode, session.mode))
-    );
+  // Independent of each other — neither depends on the other's result — so
+  // run them concurrently instead of as two sequential round trips.
+  const [, [{ value: priorCount }]] = await Promise.all([
+    db
+      .update(quizSessions)
+      .set({ status: "completed", score, completedAt: now })
+      .where(eq(quizSessions.id, sessionId)),
+    db
+      .select({ value: countFn() })
+      .from(attempts)
+      .where(
+        session.mode === "contest"
+          ? and(
+              eq(attempts.userId, session.userId),
+              eq(attempts.mode, session.mode),
+              eq(attempts.roundId, session.roundId!)
+            )
+          : and(eq(attempts.userId, session.userId), eq(attempts.mode, session.mode))
+      ),
+  ]);
 
   await db.insert(attempts).values({
     sessionId: session.id,
@@ -483,27 +484,16 @@ export async function getCurrentQuestionOrderIndex(sessionId: string) {
 
 /** Re-derives the same question payload shape startSession/nextQuestion return, for page loads. */
 export async function getQuestionPayload(sessionId: string, orderIndex: number) {
-  const [sq] = await db
-    .select()
-    .from(sessionQuestions)
-    .where(and(eq(sessionQuestions.sessionId, sessionId), eq(sessionQuestions.orderIndex, orderIndex)));
-  if (!sq || !sq.deadlineAt) return null;
-
-  const [question] = await db
-    .select({ questionText: questions.questionText })
-    .from(questions)
-    .where(eq(questions.id, sq.questionId));
-
-  const [session] = await db
-    .select({ questionCount: quizSessions.questionCount })
-    .from(quizSessions)
-    .where(eq(quizSessions.id, sessionId));
+  const detail = await loadSessionQuestionDetail(sessionId, orderIndex);
+  if (!detail) return null;
+  const { sessionQuestion: sq, questionText, questionCount } = detail;
+  if (!sq.deadlineAt) return null;
 
   return {
     orderIndex: sq.orderIndex,
-    questionText: question?.questionText ?? "",
+    questionText,
     shuffledOptions: sq.shuffledOptions,
     deadlineAt: sq.deadlineAt.toISOString(),
-    totalQuestions: session?.questionCount ?? QUESTIONS_PER_QUIZ,
+    totalQuestions: questionCount,
   };
 }
