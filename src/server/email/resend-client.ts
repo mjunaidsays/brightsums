@@ -1,6 +1,8 @@
 import "server-only";
 import { Resend } from "resend";
 
+export type SendEmailInput = { to: string; subject: string; html: string };
+
 const apiKey = process.env.RESEND_API_KEY;
 const resend = apiKey ? new Resend(apiKey) : null;
 
@@ -24,7 +26,7 @@ const fromAddress = process.env.RESEND_FROM_EMAIL || "BrightSums <onboarding@res
  * recipient, etc.) silently vanishes and every caller wrongly believes the
  * email went out.
  */
-export async function sendEmail(input: { to: string; subject: string; html: string }) {
+export async function sendEmail(input: SendEmailInput) {
   if (!resend) {
     console.log(`[email:dev-fallback] To: ${input.to} | Subject: ${input.subject}\n${input.html}`);
     return;

@@ -2,7 +2,7 @@ import { betterAuth } from "better-auth";
 import { drizzleAdapter } from "better-auth/adapters/drizzle";
 import { db } from "@/server/db/client";
 import * as schema from "@/server/db/schema";
-import { sendEmail } from "@/server/email/resend-client";
+import { sendEmail } from "@/server/email/client";
 
 /**
  * Better Auth server config — email/password only for launch. Owns its own
