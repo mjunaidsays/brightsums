@@ -1,4 +1,5 @@
 import "server-only";
+import { cache } from "react";
 import { headers } from "next/headers";
 import { redirect } from "next/navigation";
 import { eq } from "drizzle-orm";
@@ -7,13 +8,21 @@ import { db } from "@/server/db/client";
 import { users } from "@/server/db/schema";
 import type { GradeBand } from "@/lib/constants";
 
-/** The raw Better Auth session (credential identity only), or null. */
-export async function getAuthSession() {
+/**
+ * The raw Better Auth session (credential identity only), or null.
+ * Wrapped in React's cache() so multiple call-sites within the same request
+ * (e.g. a layout and a page both requiring auth) share one lookup instead of
+ * each re-hitting the session store.
+ */
+export const getAuthSession = cache(async () => {
   return auth.api.getSession({ headers: await headers() });
-}
+});
 
-/** Full BrightSums profile for the currently authenticated user, or null. */
-export async function getCurrentUser() {
+/**
+ * Full BrightSums profile for the currently authenticated user, or null.
+ * Also request-memoized — see getAuthSession().
+ */
+export const getCurrentUser = cache(async () => {
   const session = await getAuthSession();
   if (!session) return null;
 
@@ -24,7 +33,7 @@ export async function getCurrentUser() {
     .limit(1);
 
   return profile ?? null;
-}
+});
 
 /**
  * A completed student profile — narrows the nullable student-only columns
@@ -57,11 +66,7 @@ export async function requireStudent(): Promise<StudentProfile> {
   const session = await getAuthSession();
   if (!session) redirect("/login");
 
-  const [profile] = await db
-    .select()
-    .from(users)
-    .where(eq(users.betterAuthUserId, session.user.id))
-    .limit(1);
+  const profile = await getCurrentUser();
   if (!profile) redirect("/signup/profile");
   if (profile.role === "admin") redirect("/admin");
 
@@ -73,11 +78,7 @@ export async function requireAdmin() {
   const session = await getAuthSession();
   if (!session) redirect("/login");
 
-  const [profile] = await db
-    .select()
-    .from(users)
-    .where(eq(users.betterAuthUserId, session.user.id))
-    .limit(1);
+  const profile = await getCurrentUser();
   if (!profile) redirect("/signup/profile");
   if (profile.role !== "admin") redirect("/dashboard");
 
